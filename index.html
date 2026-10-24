@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>📱 كاميرا ذكية | كل الميزات</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  body{
+    font-family:-apple-system,Segoe UI,Arial,sans-serif;
+    background:#0d1117;color:#e6edf3;
+    min-height:100vh;display:flex;flex-direction:column;align-items:center;
+    padding:8px;gap:8px;overflow-x:hidden;
+  }
+  h1{font-size:16px;color:#58a6ff;text-align:center;font-weight:700}
+  .stage{
+    position:relative;width:100%;max-width:720px;aspect-ratio:4/3;
+    background:#000;border-radius:14px;overflow:hidden;
+    border:2px solid #58a6ff;box-shadow:0 0 30px #58a6ff33;
+  }
+  video{display:none}
+  canvas{width:100%;height:100%;display:block}
+  .controls{
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(105px,1fr));
+    gap:6px;width:100%;max-width:720px;
+  }
+  button{
+    padding:10px 6px;border:none;border-radius:9px;
+    background:#21262d;color:#c9d1d9;font-size:12px;font-weight:600;
+    cursor:pointer;transition:.15s;border:1px solid #30363d;
+  }
+  button.on{background:#238636;color:#fff;border-color:#2ea043}
+  button.primary{background:#1f6feb;color:#fff;border-color:#388bfd}
+  button.danger{background:#da3633;color:#fff;border-color:#f85149}
+  button:active{transform:scale(.95)}
+  .stats{
+    display:flex;gap:8px;font-size:11px;color:#8b949e;
+    background:#161b22;padding:6px 10px;border-radius:10px;
+    border:1px solid #30363d;flex-wrap:wrap;justify-content:center;
+    width:100%;max-width:720px;
+  }
+  .stats b{color:#58a6ff}
+  .sliders{
+    display:grid;grid-template-columns:1fr 1fr;gap:6px;
+    width:100%;max-width:720px;font-size:11px;
+  }
+  .sliders label{display:flex;flex-direction:column;gap:2px;color:#8b949e}
+  input[type=range]{width:100%;accent-color:#58a6ff}
+  .hidden{display:none!important}
+  .badge{
+    position:absolute;top:8px;right:8px;
+    background:#1f6feb;color:#fff;padding:3px 10px;
+    border-radius:20px;font-size:11px;font-weight:700;
+  }
+</style>
+</head>
+<body>
+
+<h1>📱 كاميرا ذكية — كل الميزات</h1>
+
+<div class="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="view"></canvas>
+  <div id="badge" class="badge hidden">● REC</div>
+</div>
+
+<div class="controls">
+  <button id="btnStart" class="primary" onclick="startCamera()">▶️ تشغيل</button>
+  <button id="btnFlip" onclick="flipCamera()">🔄 الكاميرا</button>
+  <button id="btnSnap" onclick="snapshot()">📸 لقطة</button>
+  <button id="btnRec" onclick="toggleRecord()">🎥 تسجيل</button>
+  <button id="btnLines" onclick="toggle('lines')">📏 الخطوط</button>
+  <button id="btnBoxes" onclick="toggle('boxes')">⬛ المربعات</button>
+  <button id="btnCircles" onclick="toggle('circles')">⭕ الدوائر</button>
+  <button id="btnEdges" onclick="toggle('edges')">🔲 الحدود</button>
+  <button id="btnColor" onclick="toggle('color')">🎨 لون</button>
+  <button id="btnMotion" onclick="toggle('motion')">🧍 حركة</button>
+  <button id="btnFace" onclick="toggle('face')">😀 وجوه</button>
+  <button id="btnObj" onclick="toggle('obj')">🎯 أجسام</button>
+  <button id="btnBarcode" onclick="toggle('barcode')">🔍 QR</button>
+  <button id="btnGrayscale" onclick="toggle('gray')">🌗 رمادي</button>
+</div>
+
+<div class="sliders">
+  <label>سطوع <input id="bright" type="range" min="50" max="150" value="100"></label>
+  <label>تباين <input id="contrast" type="range" min="50" max="150" value="100"></label>
+</div>
+
+<div class="stats">
+  <span>خطوط: <b id="nLines">0</b></span>
+  <span>مربعات: <b id="nBoxes">0</b></span>
+  <span>دوائر: <b id="nCircles">0</b></span>
+  <span>أجسام: <b id="nObj">0</b></span>
+  <span>FPS: <b id="fps">0</b></span>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+
+<script>
+/* ============================================================
+   الحالة العامة
+   ============================================================ */
+const W = 640, H = 480;
+let facing = 'environment';
+let stream = null;
+let recorder = null;
+let chunks = [];
+
+const state = {
+  lines:false, boxes:false, circles:false, edges:false,
+  color:false, motion:false, face:false, obj:false,
+  barcode:false, gray:false
+};
+
+const video  = document.getElementById('video');
+const view   = document.getElementById('view');
+const ctx    = view.getContext('2d');
+view.width = W; view.height = H;
+
+const work = document.createElement('canvas');
+work.width = W; work.height = H;
+const wctx = work.getContext('2d', { willReadFrequently: true });
+
+let prevFrame = null;
+let objModel = null;
+let objDetections = [];
+let lastObjDetect = 0;
+
+/* ============================================================
+   الكاميرا
+   ============================================================ */
+async function startCamera(){
+  try{
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width:{ideal:W}, height:{ideal:H} },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    document.getElementById('btnStart').textContent = '✅ تعمل';
+    loop();
+  }catch(e){
+    alert('تعذّر فتح الكاميرا:\n' + e.message + '\n\nالموقع يحتاج HTTPS');
+  }
+}
+
+function flipCamera(){
+  facing = (facing==='environment') ? 'user' : 'environment';
+  startCamera();
+}
+
+function toggle(kind){
+  state[kind] = !state[kind];
+  const map = {lines:'btnLines',boxes:'btnBoxes',circles:'btnCircles',edges:'btnEdges',
+    color:'btnColor',motion:'btnMotion',face:'btnFace',obj:'btnObj',
+    barcode:'btnBarcode',gray:'btnGrayscale'};
+  document.getElementById(map[kind]).classList.toggle('on', state[kind]);
+  if(kind==='obj' && state.obj) loadObjModel();
+}
+
+async function loadObjModel(){
+  if(objModel) return;
+  try{
+    objModel = await cocoSsd.load();
+  }catch(e){ console.warn('obj model fail', e); }
+}
+
+/* ============================================================
+   الحلقة الرئيسية
+   ============================================================ */
+let last = performance.now(), fpsAcc = 0, fpsCnt = 0;
+
+function loop(){
+  requestAnimationFrame(loop);
+  if(video.readyState < 2) return;
+
+  wctx.drawImage(video, 0, 0, W, H);
+  applyFilters();
+  const img = wctx.getImageData(0,0,W,H);
+
+  // الصورة الأصلية
+  ctx.drawImage(work, 0, 0);
+
+  const needEdges = state.edges || state.lines || state.boxes || state.circles;
+  const gray = needEdges ? toGray(img) : null;
+  const edges = needEdges ? sobel(gray) : null;
+
+  if(state.edges) drawEdges(edges);
+  if(state.gray) drawGray(img);
+
+  if(state.boxes){
+    const boxes = findBoxes(edges);
+    drawBoxes(boxes);
+    document.getElementById('nBoxes').textContent = boxes.length;
+  }
+
+  if(state.lines){
+    const lines = houghLines(edges);
+    drawLines(lines);
+    document.getElementById('nLines').textContent = lines.length;
+  }
+
+  if(state.circles){
+    const circles = houghCircles(edges);
+    drawCircles(circles);
+    document.getElementById('nCircles').textContent = circles.length;
+  }
+
+  if(state.color) drawColorTrack(img);
+  if(state.motion) drawMotion(img, gray);
+
+  if(state.face) detectFace();
+
+  if(state.obj && objModel && performance.now()-lastObjDetect > 500){
+    lastObjDetect = performance.now();
+    objModel.detect(video).then(d=>{ objDetections = d; }).catch(()=>{});
+  }
+  if(state.obj && objDetections.length){
+    drawObjects(objDetections);
+    document.getElementById('nObj').textContent = objDetections.length;
+  } else if(state.obj){
+    document.getElementById('nObj').textContent = 0;
+  }
+
+  if(state.barcode) detectBarcode();
+
+  // FPS
+  const now = performance.now();
+  fpsAcc += 1000/(now-last); fpsCnt++; last = now;
+  if(fpsCnt >= 15){
+    document.getElementById('fps').textContent = Math.round(fpsAcc/fpsCnt);
+    fpsAcc = 0; fpsCnt = 0;
+  }
+}
+
+/* ============================================================
+   فلاتر السطوع والتباين
+   ============================================================ */
+function applyFilters(){
+  const b = +document.getElementById('bright').value;
+  const c = +document.getElementById('contrast').value;
+  if(b===100 && c===100) return;
+  const img = wctx.getImageData(0,0,W,H);
+  const d = img.data;
+  const cf = (c/100);
+  for(let i=0;i<d.length;i+=4){
+    d[i]   = ((d[i]  -128)*cf + 128) * (b/100);
+    d[i+1] = ((d[i+1]-128)*cf + 128) * (b/100);
+    d[i+2] = ((d[i+2]-128)*cf + 128) * (b/100);
+  }
+  wctx.putImageData(img,0,0);
+}
+
+/* ============================================================
+   تحويلات مساعدة
+   ============================================================ */
+function toGray(img){
+  const d = img.data, g = new Uint8ClampedArray(W*H);
+  for(let i=0,j=0;i<d.length;i+=4,j++)
+    g[j] = (d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114)|0;
+  return g;
+}
+
+function drawGray(img){
+  const d = img.data;
+  for(let i=0;i<d.length;i+=4){
+    const v = (d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114)|0;
+    d[i]=d[i+1]=d[i+2]=v;
+  }
+  ctx.putImageData(img,0,0);
+}
+
+function sobel(g){
+  const e = new Uint8ClampedArray(W*H);
+  const gx = [-1,0,1,-2,0,2,-1,0,1];
+  const gy = [-1,-2,-1,0,0,0,1,2,1];
+  for(let y=1;y<H-1;y++){
+    for(let x=1;x<W-1;x++){
+      let sx=0,sy=0,k=0;
+      for(let dy=-1;dy<=1;dy++)
+        for(let dx=-1;dx<=1;dx++){
+          const v = g[(y+dy)*W+(x+dx)];
+          sx += v*gx[k]; sy += v*gy[k]; k++;
+        }
+      e[y*W+x] = Math.sqrt(sx*sx+sy*sy) > 80 ? 255 : 0;
+    }
+  }
+  return e;
+}
+
+function drawEdges(e){
+  const img = ctx.getImageData(0,0,W,H);
+  const d = img.data;
+  for(let i=0,j=0;j<e.length;i+=4,j++){
+    if(e[j]){ d[i]=0; d[i+1]=255; d[i+2]=255; d[i+3]=255; }
+  }
+  ctx.putImageData(img,0,0);
+}
+
+/* ============================================================
+   كشف المربعات
+   ============================================================ */
+function findBoxes(edges){
+  const visited = new Uint8Array(W*H);
+  const boxes = [];
+  const MIN_AREA = 1500;
+  const stack = [];
+
+  for(let y=2;y<H-2;y+=2){
+    for(let x=2;x<W-2;x+=2){
+      const idx = y*W+x;
+      if(!edges[idx] || visited[idx]) continue;
+      let minX=x,maxX=x,minY=y,maxY=y,count=0;
+      stack.length=0; stack.push(idx); visited[idx]=1;
+      while(stack.length){
+        const p = stack.pop();
+        const px = p%W, py = (p/W)|0;
+        count++;
+        if(px<minX)minX=px; if(px>maxX)maxX=px;
+        if(py<minY)minY=py; if(py>maxY)maxY=py;
+        for(let dy=-1;dy<=1;dy++)
+          for(let dx=-1;dx<=1;dx++){
+            if(!dx&&!dy) continue;
+            const nx=px+dx, ny=py+dy;
+            if(nx<1||ny<1||nx>=W-1||ny>=H-1) continue;
+            const ni = ny*W+nx;
+            if(edges[ni] && !visited[ni]){ visited[ni]=1; stack.push(ni); }
+          }
+      }
+      const bw=maxX-minX, bh=maxY-minY, area=bw*bh;
+      const aspect = bw/(bh||1);
+      if(area>MIN_AREA && aspect>0.3 && aspect<3.3 && bw>40 && bh>40){
+        const density = count/(bw+bh);
+        if(density>1.5) boxes.push({x:minX,y:minY,w:bw,h:bh});
+      }
+    }
+  }
+  return boxes.filter((b,i)=>!boxes.some((o,j)=>j<i &&
+    b.x>=o.x-10 && b.y>=o.y-10 &&
+    b.x+b.w<=o.x+o.w+10 && b.y+b.h<=o.y+o.h+10)).slice(0,20);
+}
+
+function drawBoxes(boxes){
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#00ff88';
+  ctx.font = 'bold 13px Arial';
+  boxes.forEach(b=>{
+    ctx.fillStyle = 'rgba(0,255,136,0.12)';
+    ctx.fillRect(b.x,b.y,b.w,b.h);
+    ctx.strokeRect(b.x,b.y,b.w,b.h);
+    ctx.fillStyle = '#00ff88';
+    ctx.fillText(`⬛ ${b.w}×${b.h}`, b.x+4, b.y+16);
+  });
+}
+
+/* ============================================================
+   Hough Lines
+   ============================================================ */
+function houghLines(edges){
+  const THRESH = 60, MAX_LINES = 30, THETA_N = 90;
+  const RHO_MAX = Math.ceil(Math.hypot(W,H));
+  const acc = new Int32Array(THETA_N*(RHO_MAX*2+1));
+  const cosT=[], sinT=[];
+  for(let t=0;t<THETA_N;t++){
+    const a = t*Math.PI/THETA_N;
+    cosT[t]=Math.cos(a); sinT[t]=Math.sin(a);
+  }
+  for(let y=0;y<H;y++)
+    for(let x=0;x<W;x++){
+      if(!edges[y*W+x]) continue;
+      for(let t=0;t<THETA_N;t++){
+        const rho = (x*cosT[t]+y*sinT[t])|0;
+        acc[t*(RHO_MAX*2+1) + rho+RHO_MAX]++;
+      }
+    }
+  const peaks=[]; const step = RHO_MAX*2+1;
+  for(let t=0;t<THETA_N;t++)
+    for(let r=0;r<step;r++){
+      const v = acc[t*step+r];
+      if(v<THRESH) continue;
+      let isPeak=true;
+      for(let dt=-2;dt<=2&&isPeak;dt++)
+        for(let dr=-2;dr<=2;dr++){
+          const nt=t+dt, nr=r+dr;
+          if(nt<0||nt>=THETA_N||nr<0||nr>=step) continue;
+          if(acc[nt*step+nr]>v){ isPeak=false; break; }
+        }
+      if(isPeak) peaks.push({t,r:r-RHO_MAX,v});
+    }
+  peaks.sort((a,b)=>b.v-a.v);
+  const lines=[];
+  for(const p of peaks){
+    if(lines.length>=MAX_LINES) break;
+    const theta = p.t*Math.PI/THETA_N;
+    const cosA=Math.cos(theta), sinA=Math.sin(theta);
+    const pts=[];
+    for(let x=0;x<W;x++){
+      const y = (p.r - x*cosA)/(sinA||1e-6);
+      if(y>=0&&y<H) pts.push({x,y});
+    }
+    for(let y=0;y<H;y++){
+      const x = (p.r - y*sinA)/(cosA||1e-6);
+      if(x>=0&&x<W) pts.push({x,y});
+    }
+    if(pts.length<2) continue;
+    const a=pts[0], b=pts[pts.length-1];
+    if(Math.hypot(a.x-b.x,a.y-b.y)<40) continue;
+    lines.push({x1:a.x,y1:a.y,x2:b.x,y2:b.y,v:p.v});
+  }
+  return lines;
+}
+
+function drawLines(lines){
+  ctx.lineWidth=2.5; ctx.strokeStyle='#ff2d55';
+  ctx.shadowColor='#ff2d55'; ctx.shadowBlur=6;
+  lines.forEach(l=>{
+    ctx.beginPath();
+    ctx.moveTo(l.x1,l.y1);
+    ctx.lineTo(l.x2,l.y2);
+    ctx.stroke();
+  });
+  ctx.shadowBlur=0;
+}
+
+/* ============================================================
+   Hough Circles (مبسّط)
+   ============================================================ */
+function houghCircles(edges){
+  const R_MIN=15, R_MAX=80;
+  const circles=[];
+  const stepR = 3;
+  // نسخة مصغرة للسرعة
+  const SC = 2;
+  const w2 = (W/SC)|0, h2 = (H/SC)|0;
+  const ed = new Uint8Array(w2*h2);
+  for(let y=0;y<h2;y++)
+    for(let x=0;x<w2;x++)
+      ed[y*w2+x] = edges[(y*SC)*W + (x*SC)];
+
+  for(let r=R_MIN; r<R_MAX; r+=stepR){
+    const acc = new Int32Array(w2*h2);
+    const r2s = r/SC;
+    for(let y=0;y<h2;y++)
+      for(let x=0;x<w2;x++){
+        if(!ed[y*w2+x]) continue;
+        for(let a=0;a<24;a++){
+          const ang = a*Math.PI/12;
+          const cx = (x - r2s*Math.cos(ang))|0;
+          const cy = (y - r2s*Math.sin(ang))|0;
+          if(cx>=0&&cy>=0&&cx<w2&&cy<h2)
+            acc[cy*w2+cx]++;
+        }
+      }
+    const thresh = 30;
+    for(let y=0;y<h2;y++)
+      for(let x=0;x<w2;x++){
+        if(acc[y*w2+x] < thresh) continue;
+        let isPeak = true;
+        for(let dy=-3;dy<=3&&isPeak;dy++)
+          for(let dx=-3;dx<=3;dx++){
+            const ny=y+dy, nx=x+dx;
+            if(ny<0||nx<0||ny>=h2||nx>=w2) continue;
+            if(acc[ny*w2+nx]>acc[y*w2+x]){ isPeak=false; break; }
+          }
+        if(isPeak){
+          circles.push({x:x*SC, y:y*SC, r:r});
+        }
+      }
+  }
+  // إزالة التكرار
+  const out=[];
+  circles.forEach(c=>{
+    if(!out.some(o=>Math.hypot(o.x-c.x,o.y-c.y)<30)) out.push(c);
+  });
+  return out.slice(0,15);
+}
+
+function drawCircles(circles){
+  ctx.lineWidth=3; ctx.strokeStyle='#ffaa00';
+  circles.forEach(c=>{
+    ctx.beginPath();
+    ctx.arc(c.x,c.y,c.r,0,Math.PI*2);
+    ctx.stroke();
+  });
+}
+
+/* ============================================================
+   تتبع لون
+   ============================================================ */
+function drawColorTrack(img){
+  const d = img.data;
+  // ابحث عن أكثر لون مشبع/متكرر
+  const hist = {};
+  for(let i=0;i<d.length;i+=16){
+    const r=d[i]>>5, g=d[i+1]>>5, b=d[i+2]>>5;
+    const k = (r<<10)|(g<<5)|b;
+    hist[k] = (hist[k]||0)+1;
+  }
+  let bestK = 0, bestV = 0;
+  for(const k in hist) if(hist[k]>bestV){ bestV=hist[k]; bestK=+k; }
+  if(bestV < 200) return;
+  const r0=(bestK>>10)<<5, g0=((bestK>>5)&31)<<5, b0=(bestK&31)<<5;
+
+  let minX=W,minY=H,maxX=0,maxY=0,cnt=0;
+  for(let y=0;y<H;y++)
+    for(let x=0;x<W;x++){
+      const i=(y*W+x)*4;
+      const dr=Math.abs(d[i]-r0), dg=Math.abs(d[i+1]-g0), db=Math.abs(d[i+2]-b0);
+      if(dr<40 && dg<40 && db<40){
+        if(x<minX)minX=x; if(x>maxX)maxX=x;
+        if(y<minY)minY=y; if(y>maxY)maxY=y;
+        cnt++;
+      }
+    }
+  if(cnt>200){
+    ctx.strokeStyle='#ff00ff';
+    ctx.lineWidth=3;
+    ctx.strokeRect(minX,minY,maxX-minX,maxY-minY);
+    ctx.fillStyle='#ff00ff';
+    ctx.font='bold 13px Arial';
+    ctx.fillText(`🎨 لون`, minX+4, minY+16);
+  }
+}
+
+/* ============================================================
+   كشف الحركة
+   ============================================================ */
+function drawMotion(img, gray){
+  if(!gray) return;
+  if(!prevFrame){ prevFrame = new Uint8ClampedArray(gray); return; }
+  const out = ctx.getImageData(0,0,W,H);
+  const od = out.data;
+  let count=0;
+  let minX=W,minY=H,maxX=0,maxY=0;
+  for(let j=0;j<gray.length;j++){
+    const diff = Math.abs(gray[j] - prevFrame[j]);
+    if(diff > 35){
+      const x = j%W, y = (j/W)|0;
+      const i = j*4;
+      od[i]=255; od[i+1]=255; od[i+2]=0; od[i+3]=255;
+      count++;
+      if(x<minX)minX=x; if(x>maxX)maxX=x;
+      if(y<minY)minY=y; if(y>maxY)maxY=y;
+    }
+  }
+  ctx.putImageData(out,0,0);
+  prevFrame = new Uint8ClampedArray(gray);
+  if(count > 1500){
+    ctx.strokeStyle='#ffff00';
+    ctx.lineWidth=3;
+    ctx.strokeRect(minX,minY,maxX-minX,maxY-minY);
+  }
+}
+
+/* ============================================================
+   كشف الوجوه (FaceDetector API)
+   ============================================================ */
+let faceDetector = null;
+async function detectFace(){
+  if(!('FaceDetector' in window)) return;
+  if(!faceDetector) faceDetector = new FaceDetector({fastMode:true, maxDetectedFaces:5});
+  try{
+    const faces = await faceDetector.detect(video);
+    ctx.strokeStyle='#00d4ff';
+    ctx.lineWidth=3;
+    ctx.fillStyle='#00d4ff';
+    ctx.font='bold 13px Arial';
+    faces.forEach(f=>{
+      const b = f.boundingBox;
+      // تحويل إحداثيات الفيديو إلى إحداثيات الكانفاس
+      const sx = W / video.videoWidth;
+      const sy = H / video.videoHeight;
+      const x=b.x*sx, y=b.y*sy, w=b.width*sx, h=b.height*sy;
+      ctx.strokeRect(x,y,w,h);
+      ctx.fillText('😀 وجه', x+4, y+16);
+    });
+  }catch(e){}
+}
+
+/* ============================================================
+   كشف الأجسام (COCO-SSD)
+   ============================================================ */
+function drawObjects(dets){
+  ctx.lineWidth=3;
+  ctx.font='bold 13px Arial';
+  dets.forEach(d=>{
+    if(d.score < 0.5) return;
+    const [x,y,w,h] = d.bbox;
+    ctx.strokeStyle='#00ff00';
+    ctx.fillStyle='#00ff00';
+    ctx.strokeRect(x,y,w,h);
+    const label = `${d.class} ${(d.score*100)|0}%`;
+    ctx.fillRect(x, y-18, ctx.measureText(label).width+10, 18);
+    ctx.fillStyle='#000';
+    ctx.fillText(label, x+5, y-4);
+  });
+}
+
+/* ============================================================
+   كشف QR / Barcode
+   ============================================================ */
+let barDetector = null;
+async function detectBarcode(){
+  if(!('BarcodeDetector' in window)) return;
+  if(!barDetector){
+    try{
+      const fmts = await BarcodeDetector.getSupportedFormats();
+      barDetector = new BarcodeDetector({formats: fmts});
+    }catch(e){ return; }
+  }
+  try{
+    const codes = await barDetector.detect(video);
+    codes.forEach(c=>{
+      const pts = c.cornerPoints;
+      if(!pts || !pts.length) return;
+      ctx.strokeStyle='#ff0000';
+      ctx.lineWidth=4;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      pts.slice(1).forEach(p=>ctx.lineTo(p.x, p.y));
+      ctx.closePath();
+      ctx.stroke();
+      ctx.fillStyle='#ff0000';
+      ctx.font='bold 14px Arial';
+      ctx.fillText(c.rawValue, pts[0].x, pts[0].y-8);
+    });
+  }catch(e){}
+}
+
+/* ============================================================
+   لقطة
+   ============================================================ */
+function snapshot(){
+  const a = document.createElement('a');
+  a.download = 'cam_' + Date.now() + '.png';
+  a.href = view.toDataURL('image/png');
+  a.click();
+}
+
+/* ============================================================
+   تسجيل فيديو
+   ============================================================ */
+function toggleRecord(){
+  const btn = document.getElementById('btnRec');
+  const badge = document.getElementById('badge');
+  if(recorder && recorder.state === 'recording'){
+    recorder.stop();
+    btn.textContent = '🎥 تسجيل';
+    btn.classList.remove('danger');
+    badge.classList.add('hidden');
+    return;
+  }
+  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9'
+             : MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8'
+             : 'video/webm';
+  recorder = new MediaRecorder(stream, { mimeType: mime });
+  chunks = [];
+  recorder.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, {type:'video/webm'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'rec_' + Date.now() + '.webm';
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  };
+  recorder.start(1000);
+  btn.textContent = '⏹️ إيقاف';
+  btn.classList.add('danger');
+  badge.classList.remove('hidden');
+}
+
+/* ============================================================
+   بدء تلقائي
+   ============================================================ */
+window.addEventListener('load', () => {
+  startCamera();
+});
+</script>
+</body>
+</html>
